@@ -41,6 +41,21 @@ class tsEncodingFFT:
         fft = encoded[:len(encoded)//2] + 1j * encoded[len(encoded)//2:]
         return np.fft.ifft(fft).real
 
+import pywt
+class tsEncodingWavelet:
+    def __init(self):
+        self.coeffShape = None
+        pass
+
+    def encode(self, ts):
+        coeffs = pywt.wavedec(ts, 'db2', level=8)
+        self.coeffShape = [coeff.shape[0] for coeff in coeffs]
+        coeffsArr = np.concatenate(coeffs)
+        return coeffsArr
+    
+    def decode(self, encoded, decodeLen):
+        coeffs = np.split(encoded, np.cumsum(self.coeffShape)[:-1])
+        return pywt.waverec(coeffs, 'db2')
 
 class tsEncodingPoly:
     def __init__(self, m):
@@ -105,7 +120,7 @@ class mtsPredictionModule:
         self.outputEncodeFunc = self.outputEncoding.encode
         self.outputDecodeFunc = self.outputEncoding.decode
         labels_arr_list = []
-        inputs = []; weights = []
+        inputs = []; inputsExog = []; weights = []
         for i in range(Xinput.shape[0]):
             curState = Xinput[i,:,:]
             curStateExog = Xexog[i,:]
@@ -116,10 +131,11 @@ class mtsPredictionModule:
                 labels.append(label)
             labels_arr_list.append(labels)
             inputVec = self.ndimTsEmbedding(curState)
-            inputVec = np.append(inputVec, curStateExog)
             inputs.append(inputVec)
+            inputsExog.append(curStateExog)
             weights.append(sig[i])
         inputs = np.array(inputs)
+        inputsExog = np.array(inputsExog)
         weights = np.array(weights)
 
         labels_arr_tensor = np.array(labels_arr_list)
@@ -128,24 +144,64 @@ class mtsPredictionModule:
             labels_arr = labels_arr_tensor[:,:,i]
             biases = np.mean(labels_arr, axis=0)
             labels_arr -= biases
-            mod = LeastSquares(params={'lambd': 0.01}).fit(inputs, labels_arr, weights=weights)
+            inputsStacked = np.column_stack([inputs, inputsExog])
+            # model = LeastSquares(params={'lambd': 0.01}).fit(inputsStacked, labels_arr, weights=weights)
+            # model = multiOutputRegressor(regressionL1Norm()).fit(inputs, labels_arr)
+            from keras.layers import Dense
 
-            self.mods.append(mod)
+            # Define the model
+            from keras.layers import Input, Concatenate, Dense
+            from keras.models import Model
+
+            input1 = Input(shape=(inputs.shape[1],))
+            input2 = Input(shape=(inputsExog.shape[1],))
+            h1 = Dense(100, activation='relu')(input1)
+            h2 = Dense(100, activation='relu')(input2)
+            h = Concatenate()([h1, h2])
+            h = Dense(32, activation='relu')(h)
+            h = Dense(32, activation='relu')(h)
+            output = Dense(labels_arr.shape[1])(h)
+            model = Model(inputs=[input1, input2], outputs=[output])
+
+            # Compile the model
+            model.compile(loss='mean_squared_error', optimizer='adam')
+
+            # Fit the model
+            model.fit([inputs, inputsExog], labels_arr, sample_weight=weights, epochs=10, verbose=1)
+
+            # Append the model and biases to the lists
+            self.mods.append(model)
             self.biases.append(biases)
+            
         return self
     
     def predict(self, X, Xexog):
-        inputvec = self.ndimTsEmbedding(X)
-        inputvec = np.append(inputvec, Xexog)
+        inputvecs = []; inputExogvecs = []
+        for i in range(X.shape[0]):
+            inputvec = self.ndimTsEmbedding(X[i,:,:])
+            inputExogvec = Xexog[i,:]
+            inputvecs.append(inputvec)
+            inputExogvecs.append(inputExogvec)
+        inputvecs = np.array(inputvecs)
+        inputExogvecs = np.array(inputExogvecs)
+        # inputvecs = np.column_stack([inputvecs, inputExogvecs])
         labels = []
         for i in range(len(self.mods)):
             mod = self.mods[i]
             bias = self.biases[i]
-            label = mod.predict(inputvec.reshape(1,-1))[0,:] + bias
+            # label = mod.predict(inputvecs) + bias
+            label = mod.predict([inputvecs, inputExogvecs]) + bias
             labels.append(label)
-        Xnew = []
-        for i in range(X.shape[1]):
-            label = np.array(list(map(lambda x: x[i], labels)))
-            n = self.outputDecodeFunc(label, self.horizon)
-            Xnew.append(n)
-        return np.array(Xnew).T
+        labels = np.array(labels)
+
+        predsAll = []
+        for i in range(labels.shape[1]):
+            preds = []
+            for j in range(labels.shape[2]):
+                label = labels[:,i,j]
+                n = self.outputDecodeFunc(label, self.horizon)
+                preds.append(n)
+            predsAll.append(preds)
+        predsAll = np.array(predsAll)
+        predsAll = predsAll.swapaxes(1, 2)
+        return predsAll
